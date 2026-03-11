@@ -1,5 +1,5 @@
 ############################################
-###Goal1: to find top REST-target genes that are negatively correlated with REST on mRNA level in GBM samples###
+### gene names conversion functions
 
 ###function to convert gene IDs to ensembl Ids###
 SYMBOLtoENS <- function(genes = character()) {
@@ -18,9 +18,9 @@ ENStoSYMBOL <- function(genes = character()) {
 }
 
 
+### original query on TCGA-GBM RNA-Seq dataset
 library(TCGAbiolinks)
 library(SummarizedExperiment)
-###querying TCGA-GBM RNA-Seq dataset###
 query_GBM <- GDCquery(project = "TCGA-GBM",
                       data.category = "Transcriptome Profiling",
                       data.type = "Gene Expression Quantification",
@@ -35,7 +35,7 @@ e_gbm <- load(file = "TCGA_exp.gbm.rda")
 colData(data)
 assays(data)
 
-###cleaning and filtering expression data###
+### cleaning and filtering expression data
 exp_Prep <- TCGAanalyze_Preprocessing(object = data, 
                                       cor.cut = 0.6,
                                       datatype = "HTSeq - FPKM-UQ")                      
@@ -44,213 +44,202 @@ exp_Filt <- TCGAanalyze_Filtering(tabDF = exp_Prep,
                                   method = "quantile", 
                                   qnt.cut =  0.25)   
 
-###transposing the matrix of counts###
+### preparing expression matrix and locating REST gene
 t_exp_matrix <- t(exp_Filt)
-dim(t_exp_matrix)
+expr <- as.data.frame(t_exp_matrix)
+dim(expr)
 
-###obtaining correlation coefficients###
-REST_position <- which(colnames(t_exp_matrix)  == "ENSG00000084093")
-out_cor <- t(cor(t_exp_matrix[, REST_position], t_exp_matrix[, -REST_position]))
-out_cor <- as.data.frame(out_cor)
+# Ensure numeric
+expr[] <- lapply(expr, as.numeric)
+REST_position <- which(colnames(expr)  == "ENSG00000084093") #locating REST gene
 
-###ranking genes###
-library(data.table)
-setDT(out_cor, keep.rownames = "Genes")
-out_cor_ranked <- out_cor[order(out_cor$V1),]
-head(out_cor_ranked, 100)
-colnames(out_cor_ranked)[2] <- "Pearson r"
+### uploading canonical REST target genes (obtained via integration of ChIP-Seq and RNA-Seq data [PMID:38609948])
+## The full list is located in this file: REST_target_genes.csv; REST_genes_qPCR_validated.csv contains experimentally-validated genes that respond to pharmacological REST degradation
+canonical_REST_targets <- as.data.frame(read.csv("REST_genes_qPCR_validated.csv"))
+canonical_REST_targets <- canonical_REST_targets[,2]
 
-###obtaining p-values and q-values###
-library(dplyr)
-out_cor_ranked %>%
-  mutate(p_value = NA) %>%
-  mutate(q_value = NA)
+# Ensure data is clean
+canonical_REST_targets <- canonical_REST_targets[!is.na(canonical_REST_targets) & canonical_REST_targets != ""]
 
-for (i in 1:nrow(out_cor_ranked)) {
-  gene_correl <- which(colnames(t_exp_matrix)  == out_cor_ranked$Genes[i])
-  out_cor_ranked$p_value[i] = cor.test(t_exp_matrix[, REST_position], t_exp_matrix[, gene_correl])$p.value
-}
+# converting to ensembl simbols
+RESTTargetGenes <- SYMBOLtoENS(canonical_REST_targets)
 
-library(WGCNA)
-qqs <- qvalue(out_cor_ranked$p_value)
-out_cor_ranked$q_value <- qqs$qvalues
+### feature engineering = REST activity z-scores
+# Z-score each gene across samples
+REST_targets_z <- scale(expr[, RESTTargetGenes])
 
-###writing all ranked correlations to a csv file###
-write.csv(as.data.frame(out_cor_ranked), "Output_TCGA_correlations_REST.csv")
+# REST represses targets → invert sign
+REST_activity <- -rowMeans(REST_targets_z, na.rm = TRUE)
 
-###Goal2: to build regression-based predictive model to assess functional (silencing) activity of REST transcription factor based on its target genes###
-###Method: forward regression with nested CV###
+# Add to metadata
+df <- colData(data)
+df$REST_activity <- REST_activity[rownames(df)]
 
-###feature selection: use top-100 negatively correlated genes and screen for those that have canonical/conserved RE-1 motif###
-###list of genes with RE-1 motifs is from https://pubmed.ncbi.nlm.nih.gov/25990720/###
+###sanity checks
 
-###convert ensembl top-100 REST-target gene IDs to hgnc-symbol###
-feature_genes_ensembl <- out_cor_ranked$Genes[1:100]
-feature_genes <- ENStoSYMBOL(feature_genes_ensembl)
+# REST activity vs REST mRNA (supposedly, is not too strong)
+REST_mRNA <- expr[,REST_position]
+names(REST_mRNA) <- rownames(expr)
+REST_protein <- df$REST_activity
 
-###accessing published binding sites of REST in ESC cells and filtering genes with conserved RE-1 motifs###
-RE1 <- as.data.frame(read_excel("Binding sites_REST_ESC_PMID25990720.xlsx", sheet = "Table S2 human (hg19)"))
-RE1 <- RE1 %>%
-  filter(`non-alignable, alignable conserved or alignable non-conserved` == "conserved" & is.na(`gene name`) == F)
-dim(RE1) ##1252 genes left
+REST_mRNA_aligned <- REST_mRNA[names(REST_protein)]
+cor(REST_protein, REST_mRNA_aligned, use = "complete.obs")
 
-###finding overlap between our feature genes and RE-1 element-containing genes###
-feature_genes_RE1 <- intersect(RE1$`gene name`, feature_genes)
-
-###converting back to ensembl ids###
-RESTTargetGenes <- SYMBOLtoENS(feature_genes_RE1)
-
-###EDA:exploring GBM patients metrics that correlate with REST mRNA###
-REST_mRNA <- c(t_exp_matrix[, "ENSG00000084093"])
-IDH_status <- data$subtype_IDH.status
-GBM_subtype <- data$subtype_Transcriptome.Subtype
-age <- data$age_at_diagnosis
-gender <- data$gender
-
-df <- data.frame(REST= REST_mRNA, IDH_status = IDH_status, 
-                 GBM_subtype = GBM_subtype, age = age,
-                 gender = gender)
-
-mod = lm(REST~GBM_subtype+gender+age+IDH_status, data=df)
-anova(mod) ## REST expression does not correlate with age, gender, and IDH status, but REST level is dependent on GBM molecular subtype###
-
-REST_CL <- df %>%
-  dplyr::filter(GBM_subtype == "CL") #classical GBM
-REST_ME <- df  %>%
-  dplyr::filter(GBM_subtype == "ME")  #mesenchymal GBM
-REST_NE <- df %>%
-  dplyr::filter(GBM_subtype == "NE")  #neural GBM
-REST_PN <- df %>%
-  dplyr::filter(GBM_subtype == "PN") #proneural GBM
-
-types <- c(rep("CL", length(REST_CL$REST)), rep("ME", length(REST_ME$REST)),
-           rep("NE", length(REST_NE$REST)), rep("PN", length(REST_PN$REST)))
-REST_mRNA <- c(REST_CL$REST, REST_ME$REST, REST_NE$REST, REST_PN$REST)
-
+# REST activity by subtype
 library(ggplot2)
-types_df <- data.frame(Type = types, REST_exp = REST_mRNA)
-p <- ggplot(types_df, aes(x = Type, y=REST_exp, color = Type)) +
-  geom_boxplot() + labs(title="REST expression (TCGA-GBM)", x=NULL, y="FPKM")
-p <- p+ theme(plot.title = element_text(size = 20))
-p<- p+ theme(text = element_text(size=20),
-             axis.text.x = element_text(size=15),
-             axis.text.y = element_text(size=15)) 
-p
-###based on this plot, REST expression is the highest in most aggressive GBMs: classical and mesenchymal types.
+ggplot(df, aes(x = subtype_Original.Subtype, y = REST_activity, fill = subtype_Original.Subtype)) +
+  geom_boxplot(outlier.shape = NA) +
+  theme_bw() +
+  labs(title = "REST activity across GBM subtypes",
+       y = "REST activity (mean z-score)") +
+  scale_y_continuous(limits = c(-3, 1.5))
 
-###adding GBM subtype to expression data###
-t_exp_matrix <- as.data.frame(t_exp_matrix)
-t_exp_data <- cbind(t_exp_matrix, df$GBM_subtype)
-names(t_exp_data)[names(t_exp_data) == 'df$GBM_subtype'] <- 'GBM_subtype'
+## Fitting GLM models for REST activity to find shared clinical characteristics significantly associated with REST 
+require(tidyverse)
+require(caret)
+require(MASS)
+require(nestfs)
+require(data.table)
+require(dplyr)
 
-t_exp_data <- t_exp_data %>%
-  dplyr::filter(is.na(GBM_subtype) == FALSE)
-dim(t_exp_data) ##29 patients without GBM subtype info were removed###
+# Checking normality of the outcome variable
+shapiro.test(REST_activity)
+hist(REST_activity, breaks = 30)
+qqnorm(REST_activity); qqline(REST_activity, col = "red") ## distribution is not normal; hence, GLM is more appropriate
 
-###Fitting models for every REST target gene to find shared predictors###
-FitFSwithNestedCV <- function(gene, data) {
-  require(tidyverse)
-  require(caret)
-  require(MASS)
-  require(nestfs)
-  require(data.table)
-  require(dplyr)
+## Cleaning missing values in GBM subtype
+clean_df_no_na_subtype <- as.data.frame(df) %>% 
+  dplyr::filter(subtype_Original.Subtype == "Classical" |
+                subtype_Original.Subtype == "Mesenchymal" |
+                subtype_Original.Subtype == "Neural" |
+                 subtype_Original.Subtype == "Proneural") %>% 
+  dplyr::select(REST_activity, subtype_Original.Subtype,
+         age_at_diagnosis, alcohol_history, gender,
+         subtype_Mutation.Count, subtype_IDH.status, subtype_X1p.19q.codeletion,
+         subtype_MGMT.promoter.status, subtype_ATRX.status, subtype_BRAF.V600E.status)
+
+# drop unused levels just in case
+clean_df_no_na_subtype$subtype_Original.Subtype <-
+  droplevels(clean_df_no_na_subtype$subtype_Original.Subtype)
+
+## modeling with Lasso regression (GLM)
   
-  ###Looking for top-10 correlated genes (pos/neg)###
-  gene_position <- which(colnames(data)  == gene)
-  cor <- t(cor(data[, gene_position], data[, -gene_position]))
-  cor <- as.data.frame(cor)
-  cor[,"Genes"] <- rownames(cor)
-  cor_ranked <- cor[order(cor$V1),]
-  cor_ranked <- na.omit(cor_ranked)
-  predictors <- c(cor_ranked$Genes[1:10], cor_ranked$Genes[(nrow(cor_ranked)-9):nrow(cor_ranked)])
-  data_reduced <- data[,c(gene, predictors, "GBM_subtype")]
+library(caret)
+library(glmnet)
 
-  ###Modeling with nested CV###
-  folds <- create.folds(5, nrow(data))
-  nest.res <- nested.fs(as.formula(paste(gene, "~ GBM_subtype")), data= data_reduced, family=gaussian(), folds=folds,
-                        min.llk.diff = 10)
-  summary(nest.res)
-}
+set.seed(1)
 
-###this loop may take a while.
-results_mod <- list()
-for (i in 1:length(RESTTargetGenes)) {
-  results_mod[i] <- FitFSwithNestedCV(RESTTargetGenes[i], data = t_exp_data)
-}
+# predictors + outcome in a single data frame
+df <- clean_df_no_na_subtype
+df <- df[complete.cases(df), ]
 
-total_res <- unlist(results_mod)
-tail(sort(table(total_res)), 10)
+# find factors with <2 levels
+one_level <- sapply(df, function(x) is.factor(x) && nlevels(x) < 2)
+df <- df[, !one_level]
 
-###saving top genes predicting REST protein level (occur more than 4 times): MAPK8IP2, ATP1A3, RUNDC3A, CDK5R1, REST, TLCD3B
-max_overlap <- c("ENSG00000008735", "ENSG00000105409", "ENSG00000108309",
-                 "ENSG00000176749", "ENSG00000084093", "ENSG00000149926")
+# also drop near-zero-variance predictors (optional but helpful)
+nzv <- nearZeroVar(df, saveMetrics = TRUE)
+df <- df[, !nzv$nzv]
 
-###Goal3: using top-overlapping predictors, to discriminate all 169 tumor samples into REST-low and REST-high###
-cor(t_exp_data[,c(max_overlap)]) ###negative correlation between REST mRNA and all these genes
-exp_data_final <- t_exp_matrix[,c(max_overlap)]
+## training
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3
+)
 
-###k-means clustering of samples into two categories###
-cl <- kmeans(exp_data_final, centers = 2, nstart = 10)
-cl$centers
+grid <- expand.grid(
+  alpha = 1,                 # LASSO
+  lambda = 10^seq(-4, 1, length.out = 50)
+)
 
-library(ggplot2)
-p <- ggplot(data = exp_data_final,
-            aes(x= ENSG00000084093, y=ENSG00000108309, color = factor(cl$cluster))) +
-  geom_point() +
-  labs(title = "Clustering of TCGA-GBM samples", y = "RUNDC3A mRNA", x = "REST mRNA")
-p
+lasso_fit <- train(
+  REST_activity ~ .,
+  data = df,
+  method = "glmnet",
+  trControl = ctrl,
+  preProcess = c("center", "scale"),
+  tuneGrid = grid
+)
 
-###Goal 4: to compare signaling pathways (proteomic data) between REST-low and REST-high samples using RPPA data to identify pathways for synergetic inhibition###
-###uploading TCGA samples (mRNA expression, 6 top-predictor genes) from cBioPortal and RPPA data, separately###
+lasso_fit
+coef(lasso_fit$finalModel, s = lasso_fit$bestTune$lambda)
 
+## model performance on a test set (20% of data)
+set.seed(1)
+idx <- createDataPartition(df$REST_activity, p = 0.8, list = FALSE)
+train_df <- df[idx, ]
+test_df  <- df[-idx, ]
+
+lasso_fit <- train(
+  REST_activity ~ .,
+  data = train_df,
+  method = "glmnet",
+  trControl = trainControl(method = "repeatedcv", number = 5, repeats = 3),
+  preProcess = c("center", "scale"),
+  tuneGrid = grid
+)
+
+pred <- predict(lasso_fit, newdata = test_df)
+postResample(pred, test_df$REST_activity)   # RMSE, Rsquared, MAE
+
+sd(REST_activity) ## RMSE << sd, model is better than null (predicting mean)
+
+## subseting patients (n = 145) into low- and high-REST groups (cutoff=median)
+clean_df_no_na_subtype$REST_group <- ifelse(
+  clean_df_no_na_subtype$REST_activity > median(clean_df_no_na_subtype$REST_activity, na.rm = TRUE),
+  "High-REST", "Low-REST"
+)
+
+
+## comparison of cell signaling (proteomic data) between REST-low and REST-high samples using RPPA data to identify pathways for synergetic inhibition
+
+## uploading open RPPA data, level 3 (normalized+scaled)
 RPPA <- as.data.frame(read_csv("TCGA-GBM-L3-S42.csv"))
-mRNA_tested_samples <- as.data.frame(read_delim("TCGA_mRNA_tested_samples.txt"))
 
-###filtering out missing values, e.g. samples with Not Performed (NP) expression testing
-mRNA_tested_samples_filt <- mRNA_tested_samples %>%
-  dplyr::filter(REST != "NP")
-mRNA_tested_samples_filt <- mRNA_tested_samples_filt[,-1]
-matrix <- mRNA_tested_samples_filt[,2:7]
-rownames(matrix) <- mRNA_tested_samples_filt[,1]
-  
-###clustering these samples into high- and low-REST
-cl <- kmeans(matrix, centers = 2, nstart = 10)
-cl$centers
-res_cl <- as.data.frame(cl$cluster)
-res_cl[,"Sample_ID"] <- rownames(res_cl)
-head(res_cl)
-rownames(res_cl) <- NULL
-colnames(res_cl) <- c("Cluster", "Sample_ID")
+## merge RPPA data with REST activity
 
 ###wrangling RPPA sample-IDs and mRNA-samples-IDs so they are compatible for joining
 RPPA$Sample_ID <- substr(RPPA$Sample_ID,1,nchar(RPPA$Sample_ID)-15)
-res_cl$Sample_ID <- substr(res_cl$Sample_ID,1,nchar(res_cl$Sample_ID)-3)
+clean_df_no_na_subtype$Sample_ID <- substr(rownames(clean_df_no_na_subtype),1,12)
 
-###merging RPPA and gene expression data###
-merged_data <- merge(RPPA, res_cl, by = "Sample_ID")
-dim(merged_data)
-table(merged_data$Cluster)
+merged_RPPA <- merge(RPPA, clean_df_no_na_subtype[, c("Sample_ID", "REST_activity", "REST_group")],
+                     by = "Sample_ID")
 
-###Analysis of both clusters separately + calculating average protein expression for every protein
-merged_split <- split(merged_data, merged_data$Cluster)
-proteins <- sapply(merged_split, function(x) colMeans(x[, 4:ncol(merged_data)]))
+## assessing proliferation scores in every sample based on proliferative biomarkers 
+prolif_markers <- c("MKI67", "PCNA", "CCNB1", "CDK1", "FOXM1")
+prolif_markers <- prolif_markers[prolif_markers %in% colnames(merged_RPPA)]
 
-###sorting by cluster1 (high-REST) in the order of increasing the concentration###
-proteins <- as.data.frame(proteins)
-colnames(proteins) <- c("High-REST", "Low-REST")
-proteins_sorted <- proteins[order(proteins$`High-REST`, decreasing = F),]
-proteins_sorted
+merged_RPPA$Prolif_score <- rowMeans(
+  (merged_RPPA[, prolif_markers]),
+  na.rm = TRUE
+)
 
-###printing out ratios
-ratios <- proteins_sorted$`High-REST`/proteins_sorted$`Low-REST`
-names(ratios) <- rownames(proteins_sorted)
+## correlation between REST activity and proliferation
+cor.test(merged_RPPA$REST_activity,
+         merged_RPPA$Prolif_score,
+         method = "spearman") #NS correlation
 
-###sorting in order of decreasing ratio High/Low-REST
-ratios <- ratios[order(ratios, decreasing = T)]
-par(mar=c(15,4,4,2))
-barplot(ratios[1:20], col = "aquamarine",
-        main="High-REST associated proteins",ylab="Ratio High/Low REST",las=2)
+## pathway-level RPPA analysis - what pathways can be beneficial to target simultaneously with REST?
+library(limma)
 
-###Conclusion: several pathways like EGFR or PAI inhibition may be promising to combine with REST targeting###
+design <- model.matrix(~ REST_group, data = merged_RPPA)
+fit <- lmFit(t(merged_RPPA[, 4:(ncol(RPPA))]), design)
+fit <- eBayes(fit)
 
+topTable(fit, coef = "REST_groupLow-REST")
+
+## vis of top differentially expressed protein markers
+ggplot(merged_RPPA, aes(x = REST_group, y = HER3_pY1289, col = REST_group)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(title = "HER3_pY1289",
+       y = "Protein amount") 
+
+ggplot(merged_RPPA, aes(x = REST_group, y = Bad_pS112, col = REST_group)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(title = "Bad_pS112",
+       y = "Protein amount") 
+
+## Conclusion: apoptosis activators may be promising to combine with REST targeting
